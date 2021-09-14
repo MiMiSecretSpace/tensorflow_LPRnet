@@ -6,6 +6,18 @@ import argparse
 import cv2
 from model.LPRnet import *
 
+def solve_cudnn_error():
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    if gpus:
+        try:
+            # Currently, memory growth needs to be the same across GPUs
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            logical_gpus = tf.config.experimental.list_logical_devices('GPU')
+            print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
+        except RuntimeError as e:
+            # Memory growth must be set before GPUs have been initialized
+            print(e)
 
 def infer_single_image(checkpoint, fname):
 
@@ -13,8 +25,8 @@ def infer_single_image(checkpoint, fname):
         print('file {} does not exist.'.format(fname))
         return
 
-    img_w = IMG_SIZE[0]
-    img_h = IMG_SIZE[1]
+    img_w = IMG_SIZE[0] # 94
+    img_h = IMG_SIZE[1] # 24
 
     img = cv2.imread(fname)
     img = cv2.resize(img, (img_w, img_h))
@@ -22,19 +34,20 @@ def infer_single_image(checkpoint, fname):
 
     # print(img_batch.shape)
     lprnet = LPRnet(is_train=False)
-
     with tf.Session() as sess:
         sess.run(lprnet.init)
         saver = tf.train.Saver(tf.global_variables())
-
+        
         if not restore_checkpoint(sess, saver, checkpoint, is_train=False):
             return
 
         test_feed = {lprnet.inputs: img_batch}
         dense_decode = sess.run(lprnet.dense_decoded, test_feed)
 
+        print(dense_decode)
         decoded_labels = []
         for item in dense_decode:
+            print(item)
             expression = ['' if i == -1 else DECODE_DICT[i] for i in item]
             expression = ''.join(expression)
             decoded_labels.append(expression)
@@ -108,6 +121,34 @@ def restore_checkpoint(sess, saver, ckpt, is_train=True):
             print("no valid checkpoint provided")
         return False
 
+def freeze_session(session, keep_var_names=None, output_names=None, clear_devices=True):
+    """
+    Freezes the state of a session into a pruned computation graph.
+
+    Creates a new computation graph where variable nodes are replaced by
+    constants taking their current value in the session. The new graph will be
+    pruned so subgraphs that are not necessary to compute the requested
+    outputs are removed.
+    @param session The TensorFlow session to be frozen.
+    @param keep_var_names A list of variable names that should not be frozen,
+                          or None to freeze all the variables in the graph.
+    @param output_names Names of the relevant graph outputs.
+    @param clear_devices Remove the device directives from the graph for better portability.
+    @return The frozen graph definition.
+    """
+    graph = session.graph
+    with graph.as_default():
+        freeze_var_names = list(set(v.op.name for v in tf.global_variables()).difference(keep_var_names or []))
+        output_names = output_names or []
+        output_names += [v.op.name for v in tf.global_variables()]
+        input_graph_def = graph.as_graph_def()
+        if clear_devices:
+            for node in input_graph_def.node:
+                node.device = ""
+        frozen_graph = tf.graph_util.convert_variables_to_constants(
+            session, input_graph_def, output_names, freeze_var_names)
+    return frozen_graph
+
 def train(checkpoint, runtime_generate=False):
     lprnet = LPRnet(is_train=True)
     train_gen = utils.DataIterator(img_dir=TRAIN_DIR, runtime_generate=runtime_generate)
@@ -129,7 +170,11 @@ def train(checkpoint, runtime_generate=False):
             ckpt_file = os.path.join(ckpt_dir, \
                         'LPRnet_steps{}_loss_{:.3f}.ckpt'.format(steps, loss))
             if not os.path.isdir(ckpt_dir): os.mkdir(ckpt_dir)
-            saver.save(sess, ckpt_file)
+            saver.save(sess, ckpt_file, write_meta_graph=True)
+
+            #frozen_graph = freeze_session(sess, output_names=['conv_out'])
+            #tf.train.write_graph(frozen_graph, "/home/mlst01/CarCarder/tensorflow_LPRnet/finalCKP", "my_model.pb", as_text=True)
+
             print('checkpoint ', ckpt_file)
         return loss, steps, lr
 
@@ -180,7 +225,9 @@ if __name__ == "__main__":
                         type=str, default=None)
 
     args = parser.parse_args()
-
+    
+    solve_cudnn_error()
+    
     if args.mode == 'train':
         train(checkpoint=args.ckpt, runtime_generate=args.runtime)
     elif args.mode == 'test':
